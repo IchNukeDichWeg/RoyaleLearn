@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 
     from ..api.policy import ObsBatch
 
-__all__ = ["PolicyLayout", "PolicyTransform", "transform_problems"]
+__all__ = ["PolicyLayout", "PolicyTransform", "attach_policy_transform", "transform_problems"]
 
 #: How far apart a row's output may be when it is batched with other rows than before.
 ROW_ATOL = 1e-5
