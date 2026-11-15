@@ -240,6 +240,10 @@ def standardise(advantages: Tensor, mask: Tensor) -> Tensor:
 # --------------------------------------------------------------------------
 
 
+#: ``PPOUpdate._timed``'s end of an iterator.
+_END = object()
+
+
 class _PhaseClock:
     """Seconds by phase across one update, without a synchronisation per phase.
 
@@ -644,7 +648,7 @@ class PPOUpdate(Update):
         )
         started_at = time.perf_counter()
         said_epoch = -1
-        for index, batch in enumerate(batches):
+        for index, batch in enumerate(self._timed(batches, "gather")):
             epoch = index // per_epoch if per_epoch else 0
             if self.progress is not None and epoch != said_epoch:
                 # The update is the long quiet phase -- on a contended machine it has run for
@@ -666,7 +670,7 @@ class PPOUpdate(Update):
             actor_scale = 1.0 / max(
                 1, batch.n_choice if self._choice_mean else batch.n_samples
             )
-            for minibatch in batch:
+            for minibatch in self._timed(batch, "gather"):
                 # "first" is the first minibatch whose ACTOR ran, not the first minibatch.
                 # Under `all` they are the same one and nothing changes. Under a skipping value
                 # the first minibatch can hold no choice row at all -- at the shipped forced rate
@@ -756,6 +760,17 @@ class PPOUpdate(Update):
                 f"{self.backoff.lr_actor:g} and {self.backoff.lr_critic:g}"
             )
         return result
+
+    def _timed(self, items: Iterable[Any], phase: str) -> Iterator[Any]:
+        """``items`` as they are, each one's production timed as ``phase``: a minibatch is
+        gathered and decoded from the rectangle when its batch yields it."""
+        iterator = iter(items)
+        while True:
+            with self._clock.phase(phase):
+                item = next(iterator, _END)
+            if item is _END:
+                return
+            yield item
 
     def _minibatch(
         self,

@@ -217,6 +217,11 @@ METRICS: dict[str, MetricSpec] = {
     "time/update_optimizer": _m(
         "s", "Seconds of the update's epochs clipping gradients and stepping. Device time."
     ),
+    "time/update_gather": _m(
+        "s",
+        "Seconds of the update's epochs building each minibatch from the rectangle: the rows' "
+        "gather and decode. Device time.",
+    ),
     "time/checkpoint": _m("s", "Seconds writing checkpoints this iteration."),
     "time/gate": _m("s", "Seconds in the promotion gate this iteration."),
     "time/probe": _m(

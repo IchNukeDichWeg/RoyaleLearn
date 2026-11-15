@@ -69,7 +69,8 @@ class UpdateResult(msgspec.Struct):
     #: Seconds of the epochs by phase, on the device's own clock: "critic" (its forward and
     #: backward where it runs apart from the actor), "actor" (the policy's forward), "terms"
     #: (the extra actor-loss terms' forwards), "backward" (the actor's backward, the terms' with
-    #: it) and "optimizer" (clipping and the steps). A phase a path does not run is absent.
+    #: it), "optimizer" (clipping and the steps) and "gather" (building each minibatch from the
+    #: rectangle: the rows' gather and decode). A phase a path does not run is absent.
     phase_seconds: dict[str, float] = msgspec.field(default_factory=dict)
     #: Share of each optimizer's parameters whose second moment sits under its own ``eps``, where
     #: Adam stops normalising and the step becomes proportional to the gradient again. ``None``

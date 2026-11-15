@@ -19,8 +19,8 @@ from royalelearn.testing import coordinator, tiny_config
 @pytest.mark.parametrize(
     "forced_rows,phases",
     [
-        ("all", {"actor", "backward", "optimizer"}),
-        ("critic_only", {"critic", "actor", "backward", "optimizer"}),
+        ("all", {"actor", "backward", "optimizer", "gather"}),
+        ("critic_only", {"critic", "actor", "backward", "optimizer", "gather"}),
     ],
 )
 def test_the_update_says_where_its_seconds_went(

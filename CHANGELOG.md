@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `time/update_gather`: the update's seconds building each minibatch from the rectangle (the
+  rows' gather and decode), which the other phases left out and a run's time/update counted.
+
 ## 0.5.26
 
 - `rollout.eval_lockstep`: each evaluation worker plays `rollout.eval_games_per_worker` of its
