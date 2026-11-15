@@ -60,8 +60,8 @@ from .config import (
     cuda_graphs_of,
     dump_config,
     geometry,
+    learner_gpus_of,
     pfsp_source_of,
-    policy_transform_of,
     rollback_after_of,
     rollback_below_of,
     validate,
@@ -1238,6 +1238,7 @@ class LearningCoordinator:
             )
             self.buffer.set_static_planes(report.statics)
             self._train_gather = RectGather(self.buffer, rows=self.geometry.n_slots)
+        self._start_learner_group()
         self.probe = PolicyProbe(self.spec)
         self.sinks: MetricsSink = build_sinks(
             config.metrics.sinks,
@@ -1285,6 +1286,8 @@ class LearningCoordinator:
             getattr(self, "source", None),
             getattr(self, "player", None),
             getattr(self, "eval_player", None),
+            # Before the buffers: the helpers are attached to the training rectangle.
+            getattr(self, "learner_group", None),
             getattr(self, "sinks", None),
             getattr(self, "results", None),
         ):
@@ -1299,6 +1302,70 @@ class LearningCoordinator:
         for buffer in {id(b): b for b in buffers if b is not None}.values():
             with contextlib.suppress(Exception):
                 buffer.close()
+
+    def _start_learner_group(self) -> None:
+        """``rollout.learner_gpus`` above one: the helper ranks, attached to the training
+        rectangle, and the update told it has them."""
+        import torch
+
+        from .learn import ddp
+
+        world = learner_gpus_of(self.config.rollout)
+        #: The helper ranks (``learn/ddp.py``), or None on one GPU.
+        self.learner_group: Any = None
+        if world <= 1:
+            return
+        device = torch.device(self.device)
+        if device.type == "cuda":
+            available = torch.cuda.device_count()
+            if available < world:
+                raise PreflightError(
+                    f"rollout.learner_gpus is {world} and this machine shows {available} GPU(s)"
+                )
+        elif not ddp.ALLOW_CPU_GROUPS:
+            raise PreflightError(
+                f"rollout.learner_gpus is {world} and this run is on {device}: the setting "
+                "spreads the update over GPUs"
+            )
+        if self._given_terms:
+            raise PreflightError(
+                "rollout.learner_gpus above 1 builds each helper's actor-loss terms from the "
+                "config's sections, and this run was handed terms of its own"
+            )
+        from .rollout.preflight import logit_precision_name
+
+        assert self.report is not None
+        recipe = ddp.RunRecipe(
+            config=self.config,
+            spec=self.spec,
+            codec_path=self.codec_path,
+            codec_table=self.report.table,
+            statics=self.report.statics,
+            segment=self.buffer.segment_name,
+            run_id=self.run_id,
+            cycles=self.geometry.cycles,
+            n_slots=self.geometry.n_slots,
+            artifact_spec=self.artifact_spec(),
+            snapshot_root=str(self.run_dir / "snapshots"),
+            snapshot_template=self.snapshot_template,
+            max_resident=self.config.ladder.max_resident_opponents + 2,
+            ratio_atol=self._ratio_atol(),
+            precision=logit_precision_name(self.config),
+            stage_layout=self.update.stage_layout,
+            resuming=self.resume_from is not None,
+        )
+        self.learner_group = ddp.LearnerGroup(
+            recipe,
+            world,
+            device=self.device,
+            champion=self._ladder_champion,
+            printer=self.printer,
+        )
+        self.update.group = self.learner_group
+        self.printer(
+            f"learners      {world} GPUs ({', '.join(self.learner_group.devices)}): each trains "
+            "its share of every batch, this process sums the gradients and steps"
+        )
 
     def _ratio_atol(self) -> float:
         """The tolerance the ratio invariant is asserted at, under this run's precision.
@@ -1474,18 +1541,14 @@ class LearningCoordinator:
 
     def _attach_policy_transform(self) -> None:
         """``ppo.policy_transform`` on the model, bound to this run's action layout."""
-        mode = policy_transform_of(self.config.ppo)
-        if mode is None:
-            return
-        from .learn.transform import PolicyLayout, PolicyTransform
+        from .learn.transform import attach_policy_transform
 
-        tiles = int(self.spec.tiles[0]) * int(self.spec.tiles[1])
-        hand = int(self.spec.hand_size)
-        layout = PolicyLayout(hand, tiles, int(self.spec.n_actions) - 1 - hand * tiles)
         try:
-            self.model.policy_transform = PolicyTransform(mode, layout)
+            mode = attach_policy_transform(self.model, self.config, self.spec)
         except ValueError as exc:
             raise PreflightError(str(exc)) from exc
+        if mode is None:
+            return
         self.printer(
             f"policy        {mode}: the learner's seats and the update; snapshots and "
             "evaluation play the actor itself"

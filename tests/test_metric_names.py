@@ -192,6 +192,7 @@ PUBLISHED_KEYS = (
     "time/update_backward",
     "time/update_critic",
     "time/update_gather",
+    "time/update_sync",
     "time/update_optimizer",
     "time/update_terms",
     "time/worker_busy",

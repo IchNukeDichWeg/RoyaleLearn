@@ -139,6 +139,7 @@ EXCLUDED: dict[str, Change] = {
     "rollout.eval_games_per_worker": _rollout_change(eval_games_per_worker=8),
     "rollout.eval_device": _rollout_change(eval_device="cuda"),
     "rollout.eval_lockstep": _rollout_change(eval_lockstep=True),
+    "rollout.learner_gpus": _rollout_change(learner_gpus=4),
     "checkpoint.keep": _config_change(
         checkpoint=msgspec.structs.replace(C.CheckpointConfig(), keep=2)
     ),

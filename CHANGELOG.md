@@ -4,6 +4,20 @@
 
 - `time/update_gather`: the update's seconds building each minibatch from the rectangle (the
   rows' gather and decode), which the other phases left out and a run's time/update counted.
+- `rollout.learner_gpus`: the update on several GPUs of one machine. The coordinator spawns a
+  helper process per further GPU (no torchrun; the launch line does not change), each attached to
+  the training rectangle's shared segment. Every trainable cell belongs to one rank for the
+  iteration; each rank trains its cells of every batch, the gradients are summed onto rank 0,
+  which clips and steps, and the parameters are broadcast back. Rank 0's weights reach the
+  helpers at the start of every update, so a resume, a rollback or starting weights need nothing
+  more. The diagnostics, the ratio invariant and the terms' measurements are rank 0's (one
+  minibatch in N); a debug iteration compares each helper's first minibatch with rank 0's gather
+  of the same cells. Left out of the run identity; refused under `determinism.tier` run_exact.
+  `time/update_sync` is the update's seconds between the ranks.
+- `RunContext.learner_rank` and `learner_world`: which rank an extension's terms are built on,
+  so a term that draws rows of its own can draw a different stream on each.
+- `Batch.shard`, `RectBuffer(attach=True)`, `replica_columns` / `take_replica_columns` and
+  `learn.transform.attach_policy_transform`, which the helper ranks are built from.
 
 ## 0.5.26
 

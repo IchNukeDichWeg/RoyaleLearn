@@ -77,6 +77,11 @@ class RunContext(NamedTuple):
     #: ``(snapshot_id, actor) -> None``: a pool snapshot's weights, as the pool stores them
     #: (float16), loaded into an actor ``build_actor`` built.
     load_snapshot: Callable[[str, Any], None] | None = None
+    #: ``rollout.learner_gpus``: which of the update's processes this context is in, and how
+    #: many there are. A helper rank builds its own terms through its own context; a term that
+    #: draws rows of its own (a ``minibatch`` term) should draw a different stream on each rank.
+    learner_rank: int = 0
+    learner_world: int = 1
 
 
 class Extension(Protocol):

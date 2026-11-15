@@ -60,6 +60,7 @@ from ..api.update import ActorTermInputs, Update, UpdateResult, check_actor_term
 from ..config import PPOConfig, policy_transform_of
 from ..errors import CheckpointFormatError
 from ..seeding import PPO_MINIBATCH, derive_generator, stream_path
+from .ddp import minibatch_digest
 from .distribution import noop_checked_upstream, noop_violation_message
 from .inference import RectGather
 
@@ -466,6 +467,10 @@ class PPOUpdate(Update):
         self.device = torch.device(device) if device is not None else _model_device(model)
         #: The current update's phase timings (``UpdateResult.phase_seconds``).
         self._clock = _PhaseClock(self.device)
+        #: ``rollout.learner_gpus`` above one: the ranks this update shares its epochs with
+        #: (``learn/ddp.py``). None on one GPU, where nothing below changes.
+        self.group: Any = None
+        self._shared: list[Parameter] | None = None
         self.actor_params: list[Parameter] = list(model.actor_parameters())
         self.critic_params: list[Parameter] = list(model.critic_parameters())
         factory = optimizer_factory if optimizer_factory is not None else _adam
@@ -559,19 +564,8 @@ class PPOUpdate(Update):
         """
         started = time.perf_counter()
         config = self.config
-        self._behaviour = behaviour
-        self._n_slots = buffer.n_slots
-        self._ratio_unchecked = True
-        self._frozen = sched.actor_lr_scale == 0.0
-        self._apply_learning_rates(sched)
-        for term in self.extra_actor_terms:
-            term.begin(sched.cumulative_env_steps, self.device)
-        self._grad_ratios = {}
-        self._grad_ratio_pending = not self._frozen and any(
-            term.measure_grad_ratio for term in self.extra_actor_terms
-        )
+        self._begin_iteration(buffer, sched, behaviour)
         gather = self._gather_for(buffer)
-        self._clock = _PhaseClock(self.device)
 
         critic_started = time.perf_counter()
         values, n_legal = chunked_critic_pass(
@@ -622,103 +616,20 @@ class PPOUpdate(Update):
             float(advantages[choice].mean().item()) if int(choice.sum()) else 0.0
         )
         buffer.set_advantages(advantages, returns)
+        checking = self._asserts_due(sched.iteration)
+        if self.group is not None:
+            with self._clock.phase("sync"):
+                self.group.begin(self, buffer, sched, checking=checking)
 
         before_actor = parameters_to_vector(self.actor_params).detach().clone()
         before_critic = parameters_to_vector(self.critic_params).detach().clone()
 
         n_samples = int(mask.sum().item())
-        # The buffer's own rule, imported rather than restated. This used to be a math.ceil of
-        # the same division, which was right while an epoch ended in a remainder batch and wrong
-        # the moment it stopped: with the rows over spread across whole batches there are FEWER
-        # batches than the ceiling, so the labels ran ahead and the last epoch was never named.
-        # It reaches the progress line and the per-epoch diagnostics, not a gradient, but a
-        # diagnostic that says epoch 2 of 3 for the last third of an update is one a reader will
-        # act on.
-        from .buffer import batch_count
-
-        per_epoch = batch_count(n_samples, config.batch_size) if n_samples else 0
         diagnostics = _Diagnostics(config.n_epochs, self.device)
-        checking = self._asserts_due(sched.iteration)
-        batches = buffer.batches(
-            config.batch_size,
-            config.minibatch_size,
-            config.n_epochs,
-            self._rng_for_epoch(sched.iteration),
-            choice_first=self._skip_forced,
-        )
-        started_at = time.perf_counter()
-        said_epoch = -1
-        for index, batch in enumerate(self._timed(batches, "gather")):
-            epoch = index // per_epoch if per_epoch else 0
-            if self.progress is not None and epoch != said_epoch:
-                # The update is the long quiet phase -- on a contended machine it has run for
-                # three quarters of an hour -- and its own timing only reaches the metric
-                # stream once the iteration ends, so a run interrupted inside it can say
-                # nothing about how long it was. One line per epoch is enough to tell a
-                # waiting run from a stopped one and to size the phase from outside.
-                said_epoch = epoch
-                self.progress(
-                    f"updating      epoch {epoch + 1}/{config.n_epochs}, "
-                    f"{n_samples} samples, {time.perf_counter() - started_at:.0f}s in"
-                )
-            for optimizer in self.optimizers:
-                optimizer.zero_grad(set_to_none=True)
-            # The actor's denominator is a property of the BATCH under every value of the
-            # field: its rows, or the ones of them that had a choice. Taken per minibatch it
-            # would make the gradient a function of the partition, which is the one thing
-            # minibatch_size is not allowed to be.
-            actor_scale = 1.0 / max(
-                1, batch.n_choice if self._choice_mean else batch.n_samples
-            )
-            for minibatch in self._timed(batch, "gather"):
-                # "first" is the first minibatch whose ACTOR ran, not the first minibatch.
-                # Under `all` they are the same one and nothing changes. Under a skipping value
-                # the first minibatch can hold no choice row at all -- at the shipped forced rate
-                # of about nine in ten that is ordinary rather than rare -- and the check then
-                # never ran, while ppo/ratio_max_abs_dev published its default 0.0, which is the
-                # healthiest reading the key has. A check that silently does not happen is worse
-                # than one that fails.
-                #
-                # NOT COVERED BY A TEST, said rather than implied. With the choice-first
-                # partition a batch's choice rows come first, so the case needs a batch that is
-                # ENTIRELY forced followed by one that is not, and which cells land in which
-                # batch is decided by the epoch's permutation. A test would have to reproduce
-                # that permutation to plant against it. The first test written for this passed
-                # with the old gating restored, which is the reason this note exists rather than
-                # a green test.
-                first = self._ratio_unchecked and (
-                    not (self._skip_forced or self._frozen) or bool(minibatch.n_choice)
-                )
-                if first:
-                    self._ratio_unchecked = False
-                # The critic pass checked every trainable cell's no-op bit this iteration, so the
-                # distributions built below skip their own check, which would drain the stream
-                # once a minibatch. Debug iterations keep it anyway.
-                with noop_checked_upstream(active=not checking):
-                    self._minibatch(
-                        minibatch,
-                        sched,
-                        diagnostics,
-                        epoch,
-                        check=checking,
-                        first=first,
-                        actor_scale=actor_scale,
-                    )
-            with self._clock.phase("optimizer"):
-                if self._skip_forced and not self._frozen:
-                    self._zero_the_actors_missing_gradients()
-                diagnostics.gradients(
-                    clip_grad_norm_(self.actor_params, config.max_grad_norm),
-                    clip_grad_norm_(self.critic_params, config.max_grad_norm),
-                )
-                for optimizer in self.optimizers:
-                    # A frozen actor's optimizer does not step, so its moments are empty at
-                    # unfreeze rather than filled with gradients of a policy that was not
-                    # allowed to move.
-                    if self._frozen and optimizer is self.actor_optimizer:
-                        continue
-                    optimizer.step()
-            self.model_updates += 1
+        self._epochs(buffer, sched, diagnostics, n_samples=n_samples, checking=checking)
+        if self.group is not None:
+            with self._clock.phase("sync"):
+                self.group.end(self, buffer, checking=checking)
         if self.device.type == "cuda":  # pragma: no cover - the suite runs on the CPU
             # One synchronisation for the whole update, and every .item() below is behind it.
             torch.cuda.synchronize(self.device)
@@ -760,6 +671,179 @@ class PPOUpdate(Update):
                 f"{self.backoff.lr_actor:g} and {self.backoff.lr_critic:g}"
             )
         return result
+
+    def _epochs(
+        self,
+        buffer: RectBuffer,
+        sched: ScheduleState,
+        diagnostics: _Diagnostics,
+        *,
+        n_samples: int,
+        checking: bool,
+    ) -> dict[str, Any] | None:
+        """The epochs over the rectangle, one optimizer step per batch.
+
+        Under ``rollout.learner_gpus`` each rank trains its own cells of each batch, the
+        gradients are summed onto rank 0, which steps, and its parameters come back. A helper
+        returns the digest of its first minibatch on a debug iteration, for rank 0 to compare.
+        """
+        config = self.config
+        group = self.group
+        rank = 0 if group is None else int(group.rank)
+        world = 1 if group is None else int(group.world)
+        shared = self._shared_parameters() if group is not None else []
+        want_digest = group is not None and rank != 0 and checking
+        digest: dict[str, Any] | None = None
+        # The buffer's own rule, imported rather than restated. This used to be a math.ceil of
+        # the same division, which was right while an epoch ended in a remainder batch and wrong
+        # the moment it stopped: with the rows over spread across whole batches there are FEWER
+        # batches than the ceiling, so the labels ran ahead and the last epoch was never named.
+        # It reaches the progress line and the per-epoch diagnostics, not a gradient, but a
+        # diagnostic that says epoch 2 of 3 for the last third of an update is one a reader will
+        # act on.
+        from .buffer import batch_count
+
+        per_epoch = batch_count(n_samples, config.batch_size) if n_samples else 0
+        batches = buffer.batches(
+            config.batch_size,
+            config.minibatch_size,
+            config.n_epochs,
+            self._rng_for_epoch(sched.iteration),
+            choice_first=self._skip_forced,
+            world=world,
+        )
+        started_at = time.perf_counter()
+        said_epoch = -1
+        for index, batch in enumerate(self._timed(batches, "gather")):
+            epoch = index // per_epoch if per_epoch else 0
+            if self.progress is not None and epoch != said_epoch:
+                # The update is the long quiet phase -- on a contended machine it has run for
+                # three quarters of an hour -- and its own timing only reaches the metric
+                # stream once the iteration ends, so a run interrupted inside it can say
+                # nothing about how long it was. One line per epoch is enough to tell a
+                # waiting run from a stopped one and to size the phase from outside.
+                said_epoch = epoch
+                self.progress(
+                    f"updating      epoch {epoch + 1}/{config.n_epochs}, "
+                    f"{n_samples} samples, {time.perf_counter() - started_at:.0f}s in"
+                )
+            for optimizer in self.optimizers:
+                optimizer.zero_grad(set_to_none=True)
+            # The actor's denominator is a property of the BATCH under every value of the
+            # field: its rows, or the ones of them that had a choice. Taken per minibatch it
+            # would make the gradient a function of the partition, which is the one thing
+            # minibatch_size is not allowed to be.
+            actor_scale = 1.0 / max(
+                1, batch.n_choice if self._choice_mean else batch.n_samples
+            )
+            if group is not None and index == 0 and rank == 0 and checking:
+                group.note_first_batch(batch)
+            for minibatch in self._timed(batch if group is None else batch.shard(rank), "gather"):
+                if want_digest and index == 0:
+                    # What rank 0 gathers again for this rank's first minibatch, and compares.
+                    digest = minibatch_digest(minibatch)
+                    want_digest = False
+                # "first" is the first minibatch whose ACTOR ran, not the first minibatch.
+                # Under `all` they are the same one and nothing changes. Under a skipping value
+                # the first minibatch can hold no choice row at all -- at the shipped forced rate
+                # of about nine in ten that is ordinary rather than rare -- and the check then
+                # never ran, while ppo/ratio_max_abs_dev published its default 0.0, which is the
+                # healthiest reading the key has. A check that silently does not happen is worse
+                # than one that fails.
+                #
+                # NOT COVERED BY A TEST, said rather than implied. With the choice-first
+                # partition a batch's choice rows come first, so the case needs a batch that is
+                # ENTIRELY forced followed by one that is not, and which cells land in which
+                # batch is decided by the epoch's permutation. A test would have to reproduce
+                # that permutation to plant against it. The first test written for this passed
+                # with the old gating restored, which is the reason this note exists rather than
+                # a green test.
+                first = self._ratio_unchecked and (
+                    not (self._skip_forced or self._frozen) or bool(minibatch.n_choice)
+                )
+                if first:
+                    self._ratio_unchecked = False
+                # The critic pass checked every trainable cell's no-op bit this iteration, so the
+                # distributions built below skip their own check, which would drain the stream
+                # once a minibatch. Debug iterations keep it anyway.
+                with noop_checked_upstream(active=not checking):
+                    self._minibatch(
+                        minibatch,
+                        sched,
+                        diagnostics,
+                        epoch,
+                        check=checking,
+                        first=first,
+                        actor_scale=actor_scale,
+                    )
+            if group is not None:
+                # Every rank's gradients onto rank 0, the only optimizer.
+                with self._clock.phase("sync"):
+                    group.reduce_gradients(shared)
+            if rank == 0:
+                with self._clock.phase("optimizer"):
+                    if self._skip_forced and not self._frozen:
+                        self._zero_the_actors_missing_gradients()
+                    diagnostics.gradients(
+                        clip_grad_norm_(self.actor_params, config.max_grad_norm),
+                        clip_grad_norm_(self.critic_params, config.max_grad_norm),
+                    )
+                    for optimizer in self.optimizers:
+                        # A frozen actor's optimizer does not step, so its moments are empty at
+                        # unfreeze rather than filled with gradients of a policy that was not
+                        # allowed to move.
+                        if self._frozen and optimizer is self.actor_optimizer:
+                            continue
+                        optimizer.step()
+            if group is not None:
+                with self._clock.phase("sync"):
+                    group.broadcast_parameters(shared)
+            self.model_updates += 1
+        return digest
+
+    def replica_step(
+        self, buffer: RectBuffer, sched: ScheduleState, *, checking: bool
+    ) -> dict[str, Any] | None:
+        """A helper rank's part of an update (``rollout.learner_gpus``): rank 0's weights, then
+        its own cells of every batch, the gradients to rank 0 and its parameters back.
+
+        The rectangle's advantages, returns and values are rank 0's, handed over with the
+        iteration. The ratio invariant and the gradient ratios are rank 0's to measure.
+        """
+        assert self.group is not None
+        self._begin_iteration(buffer, sched, None)
+        self._ratio_unchecked = False
+        self._grad_ratio_pending = False
+        self.group.broadcast_model(self.model)
+        mask = buffer.trainable_mask() & buffer.valid_mask()
+        n_samples = int(mask.sum().item())
+        diagnostics = _Diagnostics(self.config.n_epochs, self.device)
+        return self._epochs(buffer, sched, diagnostics, n_samples=n_samples, checking=checking)
+
+    def _begin_iteration(self, buffer: RectBuffer, sched: ScheduleState, behaviour: Any) -> None:
+        """What both ends of an update set before its epochs."""
+        self._behaviour = behaviour
+        self._n_slots = buffer.n_slots
+        self._ratio_unchecked = True
+        self._frozen = sched.actor_lr_scale == 0.0
+        self._apply_learning_rates(sched)
+        for term in self.extra_actor_terms:
+            term.begin(sched.cumulative_env_steps, self.device)
+        self._grad_ratios = {}
+        self._grad_ratio_pending = not self._frozen and any(
+            term.measure_grad_ratio for term in self.extra_actor_terms
+        )
+        self._clock = _PhaseClock(self.device)
+
+    def _shared_parameters(self) -> list[Parameter]:
+        """The parameters the optimizers hold, once each, in a fixed order."""
+        if self._shared is None:
+            seen: dict[int, Parameter] = {}
+            for parameter in (*self.actor_params, *self.critic_params):
+                if parameter.requires_grad:
+                    seen.setdefault(id(parameter), parameter)
+            self._shared = list(seen.values())
+        return self._shared
 
     def _timed(self, items: Iterable[Any], phase: str) -> Iterator[Any]:
         """``items`` as they are, each one's production timed as ``phase``: a minibatch is

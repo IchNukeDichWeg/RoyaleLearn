@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from multiprocessing import shared_memory
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -113,6 +113,7 @@ class Batch:
         gather: Callable[[np.ndarray, float], Minibatch],
         *,
         n_choice: int,
+        owners: np.ndarray | None = None,
     ) -> None:
         self.cells = cells
         self.minibatch_size = max(1, int(minibatch_size))
@@ -121,6 +122,8 @@ class Batch:
         #: and not of a minibatch, because it is a denominator and a denominator taken per
         #: minibatch would make the gradient a function of the partition.
         self.n_choice = int(n_choice)
+        #: Under ``rollout.learner_gpus``, the rank each cell belongs to, in ``cells`` order.
+        self.owners = owners
 
     @property
     def n_samples(self) -> int:
@@ -133,6 +136,23 @@ class Batch:
         total = self.n_samples
         for start in range(0, total, self.minibatch_size):
             chunk = self.cells[start : start + self.minibatch_size]
+            yield self._gather(chunk, chunk.size / total)
+
+    def chunks(self, rank: int) -> list[np.ndarray]:
+        """Rank ``rank``'s cells of this batch, in minibatches of the usual size, in order."""
+        if self.owners is None:
+            raise ValueError("this batch was cut for one learner, and has no ranks")
+        mine = self.cells[self.owners == rank]
+        return [
+            mine[start : start + self.minibatch_size]
+            for start in range(0, mine.size, self.minibatch_size)
+        ]
+
+    def shard(self, rank: int) -> Iterator[Minibatch]:
+        """Rank ``rank``'s minibatches of this batch, each weighted by its share of the WHOLE
+        batch, so that every rank's gradients together are the batch's."""
+        total = self.n_samples
+        for chunk in self.chunks(rank):
             yield self._gather(chunk, chunk.size / total)
 
 
@@ -330,6 +350,7 @@ class RectBuffer(ExperienceBuffer):
         discard_opponent_rows: bool = True,
         staging_slots: int = 4,
         segment_name: str | None = None,
+        attach: bool = False,
     ) -> None:
         self.spec = spec
         self.codec = codec
@@ -349,10 +370,18 @@ class RectBuffer(ExperienceBuffer):
             codec_version=codec.codec_version,
         )
         self._name = checked_segment_name(segment_name or buffer_segment_name(run_id))
-        self.shm = shared_memory.SharedMemory(
-            name=self._name, create=True, size=self.layout.total_bytes
-        )
-        self.layout.write_header(self.shm.buf)
+        #: Whether this object made the segment, and so unlinks it. A helper learner rank
+        #: (``rollout.learner_gpus``) attaches to rank 0's and reads it; rank 0 writes the
+        #: columns it is handed (``take_replica_columns``).
+        self._owner = not attach
+        if attach:
+            self.shm = shared_memory.SharedMemory(name=self._name)
+            self.layout.check_header(self.shm.buf)
+        else:
+            self.shm = shared_memory.SharedMemory(
+                name=self._name, create=True, size=self.layout.total_bytes
+            )
+            self.layout.write_header(self.shm.buf)
         # One row per cell, in the rectangle's own index order, so that gathering a minibatch is
         # a single take along axis zero.
         self.obs_view = np.frombuffer(
@@ -403,6 +432,11 @@ class RectBuffer(ExperienceBuffer):
 
     # -- the segment -------------------------------------------------------
 
+    @property
+    def segment_name(self) -> str:
+        """The shared segment's name, for a process that attaches to it."""
+        return self._name
+
     def shared_handle(self) -> BufferHandle:
         """What a worker is told: the name and the numbers the offsets follow from."""
         return self.layout.handle(self._name)
@@ -422,6 +456,8 @@ class RectBuffer(ExperienceBuffer):
         except BufferError:
             # Something outside this object still holds a view over the block. The mapping goes
             # when that view does; closing it under the view's feet is what must not happen.
+            return
+        if not getattr(self, "_owner", True):
             return
         with contextlib.suppress(FileNotFoundError, OSError):
             # Unlinking is what a platform with a name for the segment needs and what one
@@ -469,6 +505,37 @@ class RectBuffer(ExperienceBuffer):
         self.group.fill(GROUP_DEAD)
         self._episode_end[self.history_rows :].fill(EPISODE_END_NONE)
         self._carry_ready = True
+
+    #: What a helper learner rank needs beside the shared rows to cut the same batches and
+    #: gather the same minibatches: the columns the gather reads, and the ones ``trainable``
+    #: and the frame history read.
+    REPLICA_COLUMNS = (
+        "action",
+        "log_prob",
+        "advantage",
+        "ret",
+        "value",
+        "n_legal",
+        "valid",
+        "group",
+        "_episode_end",
+        "_history_valid",
+    )
+
+    def replica_columns(self) -> dict[str, np.ndarray]:
+        """Copies of ``REPLICA_COLUMNS``, for a helper rank's ``take_replica_columns``."""
+        return {name: getattr(self, name).copy() for name in self.REPLICA_COLUMNS}
+
+    def take_replica_columns(
+        self, iteration: int, cycles: int, columns: Mapping[str, np.ndarray]
+    ) -> None:
+        """Rank 0's iteration, on a rectangle attached to rank 0's rows."""
+        if set(columns) != set(self.REPLICA_COLUMNS):
+            raise ValueError(f"expected the columns {self.REPLICA_COLUMNS}, got {sorted(columns)}")
+        for name, values in columns.items():
+            np.copyto(getattr(self, name), values)
+        self.cycles = int(cycles)
+        self.iteration = int(iteration)
 
     def copy_from(self, other: RectBuffer) -> None:
         """Take ``other``'s collected iteration: its rows, its scalar columns and its plan.
@@ -693,6 +760,7 @@ class RectBuffer(ExperienceBuffer):
         rng_for_epoch: Callable[[int], np.random.Generator],
         *,
         choice_first: bool = False,
+        world: int = 1,
     ) -> Iterator[Batch]:
         """Every trainable cell, once per epoch, in batches that never straddle an epoch.
 
@@ -705,6 +773,10 @@ class RectBuffer(ExperienceBuffer):
         moves no cell between batches: every batch holds the cells it held, so every batch-level
         denominator is the one it was, and a caller that skips the forced rows then skips whole
         minibatches of them rather than nine rows in every ten of every minibatch.
+
+        ``world`` above one (``rollout.learner_gpus``) gives every cell a rank for the whole
+        iteration, by its place among the trainable cells, so a rank trains the same cells in
+        every epoch; ``Batch.shard`` is one rank's part of a batch.
         """
         cells = np.flatnonzero(self.trainable().reshape(-1))
         if cells.size == 0:
@@ -714,6 +786,10 @@ class RectBuffer(ExperienceBuffer):
             return
         self._ensure_ring(minibatch_size)
         has_choice = self.n_legal.reshape(-1) > 1
+        owner: np.ndarray | None = None
+        if world > 1:
+            owner = np.zeros(int(cells[-1]) + 1, dtype=np.int32)
+            owner[cells] = np.arange(cells.size, dtype=np.int32) % int(world)
         for epoch in range(epochs):
             order = cells[rng_for_epoch(epoch).permutation(cells.size)]
             for part in np.array_split(order, batch_count(order.size, batch_size)):
@@ -721,7 +797,11 @@ class RectBuffer(ExperienceBuffer):
                 if choice_first:
                     part = np.concatenate([part[chose], part[~chose]])
                 yield Batch(
-                    part, minibatch_size, self._gather, n_choice=int(np.count_nonzero(chose))
+                    part,
+                    minibatch_size,
+                    self._gather,
+                    n_choice=int(np.count_nonzero(chose)),
+                    owners=None if owner is None else owner[part],
                 )
 
     def _ensure_ring(self, minibatch_size: int) -> None:

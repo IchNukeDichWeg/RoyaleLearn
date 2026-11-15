@@ -147,3 +147,22 @@ class PolicyTransform:
                 f"with other rows (by up to {worst:.3g}): each row's output must depend on that "
                 "row alone, because the rollout and the update batch rows differently"
             )
+
+
+def attach_policy_transform(model: Any, config: Any, spec: Any) -> str | None:
+    """``ppo.policy_transform`` on ``model``, bound to the action layout of ``spec``: the mode
+    attached, or None when the run has none. One function for the coordinator and for each
+    helper learner rank (``rollout.learner_gpus``), so the two cannot bind it differently.
+
+    Raises ValueError for a mode the layout cannot take.
+    """
+    from ..config import policy_transform_of
+
+    mode = policy_transform_of(config.ppo)
+    if mode is None:
+        return None
+    tiles = int(spec.tiles[0]) * int(spec.tiles[1])
+    hand = int(spec.hand_size)
+    layout = PolicyLayout(hand, tiles, int(spec.n_actions) - 1 - hand * tiles)
+    model.policy_transform = PolicyTransform(mode, layout)
+    return str(mode)

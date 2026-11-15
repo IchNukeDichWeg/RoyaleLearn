@@ -104,6 +104,9 @@ EXCLUDED_FROM_IDENTITY: tuple[str, ...] = (
     "rollout.eval_games_per_worker",
     "rollout.eval_device",
     "rollout.eval_lockstep",
+    # Where the update's minibatches are computed, not what they are: a lineage moves from one
+    # GPU to four at a resume.
+    "rollout.learner_gpus",
     "checkpoint",
     "metrics",
     "alarms",

@@ -222,6 +222,12 @@ METRICS: dict[str, MetricSpec] = {
         "Seconds of the update's epochs building each minibatch from the rectangle: the rows' "
         "gather and decode. Device time.",
     ),
+    "time/update_sync": _m(
+        "s",
+        "Seconds of the update spent between its GPUs (rollout.learner_gpus): handing the "
+        "helpers the iteration and the weights, summing the gradients, sending the parameters "
+        "back, and waiting for the slowest. Device time.",
+    ),
     "time/checkpoint": _m("s", "Seconds writing checkpoints this iteration."),
     "time/gate": _m("s", "Seconds in the promotion gate this iteration."),
     "time/probe": _m(
@@ -1052,6 +1058,7 @@ CONDITIONAL: dict[str, str] = {
     "time/update_actor": "the actor trained this iteration",
     "time/update_terms": "an extension adds actor-loss terms and the actor trained",
     "time/update_backward": "the actor trained this iteration",
+    "time/update_sync": "rollout.learner_gpus is above 1",
     "policy/button_press_rate": "the environment has ability buttons",
     **dict.fromkeys(
         ("ppo/entropy_gate", "ppo/entropy_candidate", "ppo/entropy_tile", "ppo/p_act"),

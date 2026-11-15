@@ -190,6 +190,13 @@ class RolloutConfig(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     #: not bit-identical to one played a battle at a time. A performance setting, left out of the
     #: run identity; unset (False) plays a battle at a time, and is left out of the encoding.
     eval_lockstep: bool | msgspec.UnsetType = msgspec.UNSET
+    #: How many GPUs of this machine the update runs on (unset: 1, the one ``net.device``
+    #: names). Above one the coordinator spawns a helper process per further GPU and each trains
+    #: its share of every batch; the gradients are summed onto this process, which steps. A
+    #: performance setting, left out of the run identity, so a run can resume on a different
+    #: number; a run on several is not bit-identical to one on one, so ``determinism.tier``
+    #: run_exact refuses it.
+    learner_gpus: int | msgspec.UnsetType = msgspec.UNSET
     #: Saves completed battles to disk so they can be watched afterwards, which is the only form
     #: that works: ``time/collection`` is about 5% of an iteration and those seconds hold tens of
     #: thousands of engine ticks, so a live view is a firehose between silences. NOT part of
@@ -324,6 +331,11 @@ EVAL_DEVICES = ("cpu", "cuda")
 def eval_lockstep_of(rollout: RolloutConfig) -> bool:
     """``rollout.eval_lockstep``, with an unset one read as False."""
     return rollout.eval_lockstep is not msgspec.UNSET and bool(rollout.eval_lockstep)
+
+
+def learner_gpus_of(rollout: RolloutConfig) -> int:
+    """``rollout.learner_gpus``, with an unset one read as 1."""
+    return 1 if rollout.learner_gpus is msgspec.UNSET else int(rollout.learner_gpus)
 
 
 def eval_device_of(rollout: RolloutConfig) -> str:
@@ -1370,6 +1382,15 @@ def check_consistency(config: RunConfig) -> list[str]:
         problems.append(
             "rollout.overlap cannot run under determinism.tier run_exact: the batch collected "
             "beside the update is not in a checkpoint, so a resumed run is not the same run"
+        )
+
+    learners = learner_gpus_of(rollout)
+    if learners < 1:
+        problems.append(f"rollout.learner_gpus is {learners}; it must be at least 1")
+    elif learners > 1 and config.determinism.tier == "run_exact":
+        problems.append(
+            "rollout.learner_gpus above 1 cannot run under determinism.tier run_exact: an update "
+            "summed over several GPUs is not bit-identical to one computed on one"
         )
 
     if rollout.shards_per_worker < 1:
