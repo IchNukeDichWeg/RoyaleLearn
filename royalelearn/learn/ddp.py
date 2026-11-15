@@ -37,6 +37,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
+import msgspec
 import numpy as np
 import torch
 from torch import Tensor
@@ -535,10 +536,44 @@ class RunReplica:
 
 class RunRecipe:
     """What the coordinator hands a helper rank: everything its update is built from that the
-    helper cannot read off the config alone. Plain values, pickled once per helper."""
+    helper cannot read off the config alone. Plain values, pickled once per helper.
 
-    def __init__(self, **fields: Any) -> None:
+    The config travels as builtins and is built again on the other side: a config with
+    extension sections is an instance of a class made for those sections, which pickle cannot
+    name. Its canonical JSON is checked to be rank 0's.
+    """
+
+    def __init__(self, *, config: Any, **fields: Any) -> None:
+        from ..config import dump_config
+
         self.__dict__.update(fields)
+        table = getattr(type(config), "_extensions", {})
+        data = msgspec.to_builtins(config)
+        self._config_sections = {name: data.pop(name, None) for name in table}
+        self._config_data = data
+        self._config_json = dump_config(config)
+
+    @property
+    def config(self) -> Any:
+        """The run's config, built again from its builtins (once per process)."""
+        built = self.__dict__.get("_config_built")
+        if built is None:
+            from ..config import dump_config
+            from ..extensions import build_config
+
+            built = build_config(dict(self._config_data), dict(self._config_sections))
+            if dump_config(built) != self._config_json:
+                raise RuntimeError(
+                    "a helper rank built a config whose canonical JSON is not rank 0's: the two "
+                    "processes would train different runs"
+                )
+            self.__dict__["_config_built"] = built
+        return built
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = dict(self.__dict__)
+        state.pop("_config_built", None)
+        return state
 
     def build(self, *, rank: int, world: int, device: torch.device) -> RunReplica:
         from ..determinism import apply as apply_determinism
