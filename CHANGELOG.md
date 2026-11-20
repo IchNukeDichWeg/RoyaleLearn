@@ -12,8 +12,11 @@
   helpers at the start of every update, so a resume, a rollback or starting weights need nothing
   more. The diagnostics, the ratio invariant and the terms' measurements are rank 0's (one
   minibatch in N); a debug iteration compares each helper's first minibatch with rank 0's gather
-  of the same cells. Left out of the run identity; refused under `determinism.tier` run_exact.
-  `time/update_sync` is the update's seconds between the ranks.
+  of the same cells. The ranks join their process group together once every helper has built,
+  each helper holds its allocator to the run's `vram_fraction`, and on NCCL a collective that
+  times out raises in rank 0 (blocking wait) and a broken group is aborted rather than destroyed.
+  Left out of the run identity; refused under `determinism.tier` run_exact. `time/update_sync` is
+  the update's seconds between the ranks.
 - `RunContext.learner_rank` and `learner_world`: which rank an extension's terms are built on,
   so a term that draws rows of its own can draw a different stream on each.
 - `Batch.shard`, `RectBuffer(attach=True)`, `replica_columns` / `take_replica_columns` and

@@ -41,3 +41,18 @@ class FailsOnUpdate(RunRecipe):
 
         replica.buffer.take_replica_columns = fail  # type: ignore[method-assign]
         return replica
+
+
+class SlowSecondHelper(RunRecipe):
+    """Rank 2 builds for longer than one collective may wait, rank 1 at once: the ranks must not
+    start their rendezvous until the slowest has built."""
+
+    #: Seconds rank 2's build takes beyond the real one.
+    DELAY_S = 15.0
+
+    def build(self, **kwargs: Any) -> Any:
+        import time
+
+        if kwargs.get("rank") == 2:
+            time.sleep(self.DELAY_S)
+        return super().build(**kwargs)

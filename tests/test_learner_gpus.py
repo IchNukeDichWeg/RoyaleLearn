@@ -134,6 +134,23 @@ def test_a_helper_that_trains_on_other_rows_is_caught(
         run.iterate()
 
 
+def test_a_slow_build_does_not_time_out_a_quick_one(
+    tmp_path: Path, cpu_groups: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Three ranks, one of which builds for longer than a collective may wait.
+
+    Plant: let a helper start its rendezvous as soon as it has built, and the quick one gives up
+    waiting for the slow one before rank 0 has even joined.
+    """
+    import ddp_support
+
+    monkeypatch.setattr(ddp, "RunRecipe", ddp_support.SlowSecondHelper)
+    monkeypatch.setattr(ddp, "COLLECTIVE_TIMEOUT_S", 8.0)
+    with coordinator(_config(tmp_path, 3)) as run:
+        run.iterate()
+        assert run.learner_group.devices == ["cpu"] * 3
+
+
 def test_a_helper_that_fails_stops_the_update_with_its_reason(
     tmp_path: Path, cpu_groups: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -241,7 +241,6 @@ class LearnerGroup(Peers):
         champion: Callable[..., str | None] | None = None,
         printer: Callable[[str], None] | None = None,
     ) -> None:
-        import torch.distributed as dist
         import torch.multiprocessing as mp
 
         super().__init__(0, world)
@@ -257,11 +256,16 @@ class LearnerGroup(Peers):
         self._joined = False
         self._store_dir = tempfile.mkdtemp(prefix="royalelearn-learners-")
         store_path = os.path.join(self._store_dir, "store")
+        #: Whether a collective or a helper failed: the group is then aborted, not destroyed.
+        self._broken = False
         if self.backend == "nccl":
-            # A collective that times out raises in the thread that waits on it, so a dead
-            # helper stops the run with an error rather than a watchdog ending the process.
-            os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
-            os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "2")
+            # Set, not defaulted, for this process and the helpers it spawns. Blocking wait makes a
+            # collective that times out raise in the thread that waits on it, so a dead helper
+            # stops the run with an error; without it the timeout aborts the process. The
+            # watchdog's own handling is off, which is what aborting a broken group needs.
+            os.environ["TORCH_NCCL_BLOCKING_WAIT"] = "1"
+            os.environ["TORCH_NCCL_ASYNC_ERROR_HANDLING"] = "0"
+            torch.cuda.set_device(torch.device(self.devices[0]))
         context = mp.get_context("spawn")
         self._outbox = context.Queue()
         try:
@@ -287,15 +291,15 @@ class LearnerGroup(Peers):
                 self._inboxes.append(inbox)
                 self._procs.append(process)
             self._await("built", STARTUP_TIMEOUT_S)
-            dist.init_process_group(
-                self.backend,
-                store=dist.FileStore(store_path, world),
-                rank=0,
-                world_size=world,
-                timeout=datetime.timedelta(seconds=COLLECTIVE_TIMEOUT_S),
-            )
+            # Every rank joins together, once the slowest has built: a helper that built first
+            # would otherwise sit in the rendezvous, whose timeout is a collective's, for as long
+            # as the slowest build takes.
+            for inbox in self._inboxes:
+                inbox.put(("join", None))
+            _join(self.backend, store_path, 0, world, self.devices[0], COLLECTIVE_TIMEOUT_S)
             self._joined = True
         except BaseException:
+            self._broken = True
             self.close()
             raise
         #: The update's first batch, for the debug iteration's comparison.
@@ -364,6 +368,7 @@ class LearnerGroup(Peers):
         try:
             collective(*args)
         except Exception as exc:
+            self._broken = True
             said = self._failure_message(wait=5.0)
             if said:
                 raise HelperFailure(said) from exc
@@ -411,6 +416,7 @@ class LearnerGroup(Peers):
                     ) from None
                 continue
             if got == "failed":
+                self._broken = True
                 raise HelperFailure(f"learner rank {rank} failed:\n{detail}")
             if got != kind:
                 raise HelperFailure(f"learner rank {rank} said {got!r} where {kind!r} was due")
@@ -419,14 +425,14 @@ class LearnerGroup(Peers):
 
     def close(self) -> None:
         """Stop the helpers and leave the process group. Safe to call twice."""
-        import torch.distributed as dist
 
         for inbox in self._inboxes:
             with contextlib.suppress(Exception):
                 inbox.put(("stop", None))
         deadline = time.monotonic() + STOP_TIMEOUT_S
         for process in self._procs:
-            process.join(max(0.0, deadline - time.monotonic()))
+            # A helper inside a collective a failure left waiting reads no stop.
+            process.join(0.0 if self._broken else max(0.0, deadline - time.monotonic()))
             if process.is_alive():
                 process.terminate()
                 process.join(5.0)
@@ -439,10 +445,44 @@ class LearnerGroup(Peers):
         self._inboxes = []
         self._outbox = None
         if self._joined:
-            with contextlib.suppress(Exception):
-                dist.destroy_process_group()
+            _leave(self.backend, broken=self._broken)
             self._joined = False
         shutil.rmtree(self._store_dir, ignore_errors=True)
+
+
+def _join(
+    backend: str, store_path: str, rank: int, world: int, device: str, timeout_s: float
+) -> None:
+    """Join the default process group. On NCCL the rank's device is bound at the join, so the
+    communicator is the device's and not whichever device happens to be current."""
+    import torch.distributed as dist
+
+    kwargs: dict[str, Any] = {}
+    if backend == "nccl":
+        kwargs["device_id"] = torch.device(device)
+    timeout = datetime.timedelta(seconds=timeout_s)
+    store = dist.FileStore(store_path, world)
+    # The rendezvous waits on the store, whose own default is not the group's timeout.
+    store.set_timeout(timeout)
+    dist.init_process_group(
+        backend, store=store, rank=rank, world_size=world, timeout=timeout, **kwargs
+    )
+
+
+def _leave(backend: str, *, broken: bool) -> None:
+    """Leave the default process group. A broken NCCL group is aborted, which needs no peer:
+    destroying one with a collective still outstanding can wait for that collective."""
+    import torch.distributed as dist
+
+    if broken and backend == "nccl":
+        abort = getattr(dist.distributed_c10d, "_abort_process_group", None)
+        if abort is not None:
+            with contextlib.suppress(Exception):
+                abort()
+            if not dist.is_initialized():
+                return
+    with contextlib.suppress(Exception):
+        dist.destroy_process_group()
 
 
 def _model_layout(model: torch.nn.Module) -> list[tuple[str, tuple[int, ...], str]]:
@@ -461,22 +501,19 @@ def _helper_main(
     timeout_s: float,
 ) -> None:
     """A helper rank: build, join, then one update per message until told to stop."""
-    import torch.distributed as dist
 
     replica: Replica | None = None
     joined = False
+    broken = False
     try:
         if torch.device(device).type == "cuda":
             torch.cuda.set_device(torch.device(device))
         replica = recipe.build(rank=rank, world=world, device=torch.device(device))
         outbox.put(("built", rank, ""))
-        dist.init_process_group(
-            backend,
-            store=dist.FileStore(store_path, world),
-            rank=rank,
-            world_size=world,
-            timeout=datetime.timedelta(seconds=timeout_s),
-        )
+        kind, _ = inbox.get()
+        if kind != "join":
+            return
+        _join(backend, store_path, rank, world, device, timeout_s)
         joined = True
         peers = Peers(rank, world)
         replica.update.group = peers
@@ -486,6 +523,7 @@ def _helper_main(
                 break
             outbox.put(("done", rank, _replica_update(replica, payload)))
     except BaseException:
+        broken = True
         with contextlib.suppress(Exception):
             outbox.put(("failed", rank, traceback.format_exc()))
     finally:
@@ -493,8 +531,7 @@ def _helper_main(
             with contextlib.suppress(Exception):
                 replica.close()
         if joined:
-            with contextlib.suppress(Exception):
-                dist.destroy_process_group()
+            _leave(backend, broken=broken)
 
 
 def _replica_update(replica: Replica, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -591,6 +628,11 @@ class RunRecipe:
         config = self.config
         spec = self.spec
         apply_determinism(config.determinism.tier, torch_threads=config.determinism.torch_threads)
+        fraction = getattr(self, "vram_fraction", None)
+        if fraction is not None and device.type == "cuda":
+            # Rank 0's cap (vram_cap), on this rank's card. A refusal is ROCm's, as on rank 0.
+            with contextlib.suppress(RuntimeError):
+                torch.cuda.set_per_process_memory_fraction(float(fraction), device.index or 0)
         torch.manual_seed(derive_int(config.master_seed, stream_path(TORCH_GLOBAL)) + rank)
         codec = build_codec(
             self.codec_path, spec, self.codec_table, tuple(config.extra_component_modules)

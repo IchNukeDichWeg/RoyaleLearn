@@ -1353,6 +1353,7 @@ class LearningCoordinator:
             precision=logit_precision_name(self.config),
             stage_layout=self.update.stage_layout,
             resuming=self.resume_from is not None,
+            vram_fraction=self.vram_fraction,
         )
         self.learner_group = ddp.LearnerGroup(
             recipe,
